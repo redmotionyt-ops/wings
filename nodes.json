@@ -1,0 +1,24 @@
+[
+  {
+    "Node ID": "node-mumbai-01",
+    "Name": "Mumbai Edge 01",
+    "Region": "India",
+    "Location": "Mumbai",
+    "Flag": "IN",
+    "Host": "in-01.fluxplus.in",
+    "IP": "",
+    "Port": 443,
+    "Protocol": "https",
+    "SSL Enabled": true,
+    "Daemon Token": "astranodes_1122334455",
+    "Status": "online",
+    "Max Ram GB": 64,
+    "Max Cpu Percent": 1600,
+    "Max Disk GB": 1000,
+    "Used Ram GB": 0,
+    "Used Cpu Percent": 0,
+    "Used Disk GB": 0,
+    "Ping Ms": 28,
+    "Created At": "2026-03-30T00:00:00.000Z"
+  }
+]

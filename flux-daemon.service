@@ -1,0 +1,16 @@
+[Unit]
+Description=Flux+ Custom Wings Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fluxplus-core-edge/daemon
+EnvironmentFile=/opt/fluxplus-core-edge/daemon/.env
+ExecStart=/usr/bin/node /opt/fluxplus-core-edge/daemon/flux-daemon.js
+Restart=always
+RestartSec=3
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
