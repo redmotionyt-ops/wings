@@ -21,11 +21,11 @@ const SERVERS_DIR = path.join(ROOT_DIR, "servers");
 const STATE_FILE = path.join(ROOT_DIR, "daemon-state.json");
 const LOGS_DIR = path.join(ROOT_DIR, "daemon-logs");
 
-app.set("trust proxy", 1);
-app.use(express.json());
-ensureStorage();
-
 const runtimeProcesses = new Map();
+
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "100mb" }));
+ensureStorage();
 
 app.use((req, res, next) => {
   const authHeader = String(req.headers.authorization || "");
@@ -345,7 +345,6 @@ app.post("/wings/command/:serverId", (req, res) => {
   }
 });
 
-
 app.get("/wings/files/:serverId", (req, res) => {
   try {
     const serverId = String(req.params.serverId || "").trim();
@@ -364,12 +363,16 @@ app.get("/wings/files/:serverId", (req, res) => {
 
     const entries = fs.readdirSync(resolved, { withFileTypes: true })
       .map((entry) => {
-        const rel = path.relative(serverState.serverDir, path.join(resolved, entry.name));
+        const absolute = path.join(resolved, entry.name);
+        const stats = fs.statSync(absolute);
+        const rel = path.relative(serverState.serverDir, absolute);
         const webPath = "/" + rel.split(path.sep).join("/");
         return {
           name: entry.name,
           type: entry.isDirectory() ? "directory" : "file",
-          path: webPath
+          path: webPath,
+          size: entry.isDirectory() ? "" : formatBytes(stats.size),
+          modifiedAt: stats.mtime.toISOString()
         };
       })
       .sort((a, b) => {
@@ -437,6 +440,235 @@ app.put("/wings/file/:serverId", (req, res) => {
     return res.status(500).json({ success: false, message: "Failed to write file." });
   }
 });
+
+function handleUpload(serverId, requestPath, fileName, contentBase64) {
+  const state = readState();
+  const serverState = state[serverId];
+
+  if (!serverState) {
+    return { status: 404, body: { success: false, message: "Server not found on this node." } };
+  }
+
+  if (!isValidPanelItemName(fileName)) {
+    return { status: 400, body: { success: false, message: "Valid file name is required." } };
+  }
+
+  if (!contentBase64) {
+    return { status: 400, body: { success: false, message: "File content is required." } };
+  }
+
+  const targetDir = resolveServerFsPath(serverState, requestPath);
+  if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
+    return { status: 404, body: { success: false, message: "Target folder not found." } };
+  }
+
+  const targetFile = resolveServerFsChildPath(serverState, requestPath, fileName);
+  const buffer = Buffer.from(contentBase64, "base64");
+  fs.writeFileSync(targetFile, buffer);
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      message: "File uploaded successfully.",
+      path: toWebPath(serverState, targetFile)
+    }
+  };
+}
+
+function handleCreateFolder(serverId, requestPath, name) {
+  const state = readState();
+  const serverState = state[serverId];
+
+  if (!serverState) {
+    return { status: 404, body: { success: false, message: "Server not found on this node." } };
+  }
+
+  if (!isValidPanelItemName(name)) {
+    return { status: 400, body: { success: false, message: "Valid folder name is required." } };
+  }
+
+  const parentDir = resolveServerFsPath(serverState, requestPath);
+  if (!fs.existsSync(parentDir) || !fs.statSync(parentDir).isDirectory()) {
+    return { status: 404, body: { success: false, message: "Target folder not found." } };
+  }
+
+  const targetDir = resolveServerFsChildPath(serverState, requestPath, name);
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      message: "Folder created successfully.",
+      path: toWebPath(serverState, targetDir)
+    }
+  };
+}
+
+function handleCreateFile(serverId, requestPath, name, content) {
+  const state = readState();
+  const serverState = state[serverId];
+
+  if (!serverState) {
+    return { status: 404, body: { success: false, message: "Server not found on this node." } };
+  }
+
+  if (!isValidPanelItemName(name)) {
+    return { status: 400, body: { success: false, message: "Valid file name is required." } };
+  }
+
+  const parentDir = resolveServerFsPath(serverState, requestPath);
+  if (!fs.existsSync(parentDir) || !fs.statSync(parentDir).isDirectory()) {
+    return { status: 404, body: { success: false, message: "Target folder not found." } };
+  }
+
+  const targetFile = resolveServerFsChildPath(serverState, requestPath, name);
+  fs.writeFileSync(targetFile, String(content ?? ""), "utf8");
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      message: "File created successfully.",
+      path: toWebPath(serverState, targetFile)
+    }
+  };
+}
+
+function handleRename(serverId, oldPath, newName) {
+  const state = readState();
+  const serverState = state[serverId];
+
+  if (!serverState) {
+    return { status: 404, body: { success: false, message: "Server not found on this node." } };
+  }
+
+  if (!oldPath || oldPath === "/") {
+    return { status: 400, body: { success: false, message: "Old path is required." } };
+  }
+
+  if (!isValidPanelItemName(newName)) {
+    return { status: 400, body: { success: false, message: "Valid new name is required." } };
+  }
+
+  const oldResolved = resolveServerFsPath(serverState, oldPath);
+  if (!fs.existsSync(oldResolved)) {
+    return { status: 404, body: { success: false, message: "Original item not found." } };
+  }
+
+  const newResolved = resolveSiblingPath(serverState, oldResolved, newName);
+  fs.renameSync(oldResolved, newResolved);
+
+  return {
+    status: 200,
+    body: {
+      success: true,
+      message: "Item renamed successfully.",
+      newPath: toWebPath(serverState, newResolved)
+    }
+  };
+}
+
+function handleDelete(serverId, requestPath) {
+  const state = readState();
+  const serverState = state[serverId];
+
+  if (!serverState) {
+    return { status: 404, body: { success: false, message: "Server not found on this node." } };
+  }
+
+  if (!requestPath || requestPath === "/") {
+    return { status: 400, body: { success: false, message: "Path is required." } };
+  }
+
+  const resolved = resolveServerFsPath(serverState, requestPath);
+  if (!fs.existsSync(resolved)) {
+    return { status: 404, body: { success: false, message: "Item not found." } };
+  }
+
+  const stat = fs.statSync(resolved);
+  if (stat.isDirectory()) {
+    fs.rmSync(resolved, { recursive: true, force: true });
+  } else {
+    fs.unlinkSync(resolved);
+  }
+
+  return {
+    status: 200,
+    body: { success: true, message: "Item deleted successfully." }
+  };
+}
+
+function registerFileMutationRoutes() {
+  app.post(["/wings/files/upload/:serverId", "/wings/file-upload/:serverId"], (req, res) => {
+    try {
+      const serverId = String(req.params.serverId || "").trim();
+      const requestPath = normalizePanelRequestPath(req.body?.path || "/");
+      const fileName = String(req.body?.fileName || "").trim();
+      const contentBase64 = String(req.body?.contentBase64 || "").trim();
+      const result = handleUpload(serverId, requestPath, fileName, contentBase64);
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error("File upload error:", error);
+      return res.status(500).json({ success: false, message: error.message || "Failed to upload file." });
+    }
+  });
+
+  app.post(["/wings/files/folder/:serverId", "/wings/folder-create/:serverId"], (req, res) => {
+    try {
+      const serverId = String(req.params.serverId || "").trim();
+      const requestPath = normalizePanelRequestPath(req.body?.path || "/");
+      const name = String(req.body?.name || "").trim();
+      const result = handleCreateFolder(serverId, requestPath, name);
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error("Folder create error:", error);
+      return res.status(500).json({ success: false, message: error.message || "Failed to create folder." });
+    }
+  });
+
+  app.post(["/wings/files/create/:serverId", "/wings/file-create/:serverId"], (req, res) => {
+    try {
+      const serverId = String(req.params.serverId || "").trim();
+      const requestPath = normalizePanelRequestPath(req.body?.path || "/");
+      const name = String(req.body?.name || "").trim();
+      const content = String(req.body?.content ?? "");
+      const result = handleCreateFile(serverId, requestPath, name, content);
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error("File create error:", error);
+      return res.status(500).json({ success: false, message: error.message || "Failed to create file." });
+    }
+  });
+
+  app.patch(["/wings/file/rename/:serverId", "/wings/file-rename/:serverId"], (req, res) => {
+    try {
+      const serverId = String(req.params.serverId || "").trim();
+      const oldPath = normalizePanelRequestPath(req.body?.oldPath || "");
+      const newName = String(req.body?.newName || "").trim();
+      const result = handleRename(serverId, oldPath, newName);
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error("Rename error:", error);
+      return res.status(500).json({ success: false, message: error.message || "Failed to rename item." });
+    }
+  });
+
+  app.delete(["/wings/file/:serverId", "/wings/file-delete/:serverId"], (req, res) => {
+    try {
+      const serverId = String(req.params.serverId || "").trim();
+      const requestPath = normalizePanelRequestPath(req.query.path || "");
+      const result = handleDelete(serverId, requestPath);
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error("Delete error:", error);
+      return res.status(500).json({ success: false, message: error.message || "Failed to delete item." });
+    }
+  });
+}
+
+registerFileMutationRoutes();
 
 async function downloadPaperJar({ version, buildNumber, outputPath }) {
   const userAgent = process.env.FLUX_PAPER_USER_AGENT || "FluxPlusCore/1.0.0 (https://core.fluxplus.in)";
@@ -532,7 +764,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-
 async function startServerInternal(serverId, startupCommand = "", clearLogsFirst = true) {
   const safeServerId = String(serverId || "").trim();
   if (!safeServerId) {
@@ -625,14 +856,65 @@ function clearServerLog(serverId) {
   }
 }
 
+function isPathInsideRoot(root, target) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedTarget = path.resolve(target);
+  return resolvedTarget === resolvedRoot || resolvedTarget.startsWith(`${resolvedRoot}${path.sep}`);
+}
+
+function normalizePanelRequestPath(input = "/") {
+  let value = String(input || "/").trim().replace(/\\/g, "/");
+  if (!value.startsWith("/")) value = `/${value}`;
+  value = value.replace(/\/+/g, "/");
+  return value || "/";
+}
+
 function resolveServerFsPath(serverState, requestPath = "/") {
-  const safeParts = String(requestPath || "/").split("/").filter(Boolean);
+  const safeParts = normalizePanelRequestPath(requestPath).split("/").filter(Boolean);
   const resolved = path.resolve(serverState.serverDir, ...safeParts);
   const serverRoot = path.resolve(serverState.serverDir);
-  if (!resolved.startsWith(serverRoot)) {
+  if (!isPathInsideRoot(serverRoot, resolved)) {
     throw new Error("Path escaped server root.");
   }
   return resolved;
+}
+
+function resolveServerFsChildPath(serverState, parentPath = "/", childName = "") {
+  if (!isValidPanelItemName(childName)) {
+    throw new Error("Invalid child name.");
+  }
+  const parentResolved = resolveServerFsPath(serverState, parentPath);
+  const target = path.resolve(parentResolved, childName);
+  if (!isPathInsideRoot(serverState.serverDir, target)) {
+    throw new Error("Path escaped server root.");
+  }
+  return target;
+}
+
+function resolveSiblingPath(serverState, absolutePath, newName) {
+  if (!isValidPanelItemName(newName)) {
+    throw new Error("Invalid new name.");
+  }
+  const parentDir = path.dirname(absolutePath);
+  const target = path.resolve(parentDir, newName);
+  if (!isPathInsideRoot(serverState.serverDir, target)) {
+    throw new Error("Path escaped server root.");
+  }
+  return target;
+}
+
+function toWebPath(serverState, absolutePath) {
+  const rel = path.relative(serverState.serverDir, absolutePath);
+  return `/${rel.split(path.sep).join("/")}`;
+}
+
+function isValidPanelItemName(name) {
+  const value = String(name || "").trim();
+  if (!value) return false;
+  if (value === "." || value === "..") return false;
+  if (/[\\/]/.test(value)) return false;
+  if (value.includes("\0")) return false;
+  return true;
 }
 
 function buildDisplayPath(serverState, requestPath = "/") {
@@ -640,6 +922,20 @@ function buildDisplayPath(serverState, requestPath = "/") {
   const suffix = normalized === "/" ? "" : normalized;
   const folder = serverState.folderName || serverState.serverName || serverState.serverId;
   return `/daemon/servers/${folder}${suffix}`;
+}
+
+function formatBytes(bytes) {
+  const size = Number(bytes || 0);
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = size;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = unitIndex === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 app.listen(PORT, DAEMON_BIND_HOST, () => {
